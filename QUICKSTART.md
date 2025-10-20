@@ -32,8 +32,59 @@ python -m playwright install chromium
 ### Шаг 3: Первый запуск
 
 ```bash
+# Тест с каталогом по умолчанию (degekangyur)
 python improved_parser.py --pages 1-1b --output test_output
+
+# Или тест с каталогом degetengyur
+python improved_parser.py --kdb degetengyur --sutra D1109 --pages 1-1b --output test_tengyur
 ```
+
+## 📚 Работа с разными каталогами
+
+Парсер поддерживает несколько каталогов:
+
+### degekangyur (по умолчанию)
+Кангьюр - основные буддийские тексты
+
+```bash
+python improved_parser.py --pages 1-1b
+# Или явно:
+python improved_parser.py --kdb degekangyur --sutra d1 --pages 1-1b
+```
+
+### degetengyur
+Тенгьюр - комментарии и трактаты
+
+```bash
+python improved_parser.py --kdb degetengyur --sutra D1109 --pages 1-1b
+```
+
+**Подробнее**: См. [CATALOG_USAGE.md](CATALOG_USAGE.md) для полной информации о работе с разными каталогами.
+
+## 🖼️ Выбор формата изображений
+
+Парсер поддерживает PNG и JPEG:
+
+### PNG (по умолчанию)
+```bash
+python improved_parser.py --pages 1-1b
+```
+- ✅ Максимальное качество
+- ❌ Большой размер (~500-800 KB/страница)
+
+### JPEG (рекомендуется для ML)
+```bash
+# JPEG с качеством 95% (отличное качество)
+python improved_parser.py --pages 1-1b --image-format jpeg
+
+# JPEG с качеством 85% (оптимальный баланс)
+python improved_parser.py --pages 1-1b --image-format jpeg --jpeg-quality 85
+```
+- ✅ Хорошее качество
+- ✅ Размер в 3-10 раз меньше PNG
+- ✅ Экономия места для больших датасетов
+
+**Подробнее**: См. [IMAGE_FORMAT_GUIDE.md](IMAGE_FORMAT_GUIDE.md) для полной информации о форматах.
 
 ## Проверка результатов
 
@@ -57,17 +108,26 @@ python analyze_dataset.py --dir test_output
 ### Сбор данных
 
 ```bash
-# Парсинг первых 10 страниц тома 1
+# Парсинг первых 10 страниц тома 1 (degekangyur - по умолчанию)
 python improved_parser.py --start-page 1 --end-page 10
+
+# Парсинг из каталога degetengyur
+python improved_parser.py --kdb degetengyur --sutra D1109 --start-page 1 --end-page 10
+
+# Парсинг в JPEG (меньше размер, хорошо для ML)
+python improved_parser.py --start-page 1 --end-page 10 --image-format jpeg --jpeg-quality 85
 
 # Парсинг конкретных страниц
 python improved_parser.py --pages 1-1b 1-2a 1-2b 1-3a
 
+# Парсинг конкретных страниц из degetengyur в JPEG
+python improved_parser.py --kdb degetengyur --sutra D1109 --pages 1-1b 1-2a 1-2b --image-format jpeg
+
 # Парсинг с ограничением
 python improved_parser.py --start-page 1 --end-page 50 --max-pages 20
 
-# Парсинг нескольких томов
-python improved_parser.py --start-vol 1 --end-vol 3 --start-page 1 --end-page 100
+# Парсинг нескольких томов в JPEG
+python improved_parser.py --start-vol 1 --end-vol 3 --start-page 1 --end-page 100 --image-format jpeg --jpeg-quality 85
 ```
 
 ### Отладка

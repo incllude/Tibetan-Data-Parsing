@@ -20,7 +20,8 @@ from urllib.parse import urljoin, urlparse, parse_qs
 class ImprovedTibetanScraper:
     """Улучшенный парсер с точным сопоставлением изображений и текстов"""
     
-    def __init__(self, output_dir: str = "tibetan_data"):
+    def __init__(self, output_dir: str = "tibetan_data", kdb: str = "degekangyur", sutra: str = "d1",
+                 image_format: str = "png", jpeg_quality: int = 95):
         self.output_dir = Path(output_dir)
         self.images_dir = self.output_dir / "images"
         self.texts_dir = self.output_dir / "texts"
@@ -33,6 +34,10 @@ class ImprovedTibetanScraper:
         self.raw_dir.mkdir(parents=True, exist_ok=True)
         
         self.base_url = "https://online.adarshah.org/"
+        self.kdb = kdb  # Каталог (degekangyur, degetengyur и т.д.)
+        self.sutra = sutra  # Сутра (d1, D1109 и т.д.)
+        self.image_format = image_format.lower()  # 'png' или 'jpeg'
+        self.jpeg_quality = jpeg_quality  # Качество JPEG (1-100)
         self.metadata = []
         
     async def wait_for_page_load(self, page: Page, timeout: int = 10000):
@@ -48,13 +53,25 @@ class ImprovedTibetanScraper:
     async def extract_image_from_canvas(self, page: Page) -> Optional[str]:
         """Извлечение изображения из canvas элемента"""
         try:
+            # Формируем параметры для canvas в зависимости от формата
+            if self.image_format == 'jpeg':
+                mime_type = 'image/jpeg'
+                quality = self.jpeg_quality / 100.0
+            else:
+                mime_type = 'image/png'
+                quality = 1.0  # PNG не использует quality, но передаем для единообразия
+            
             # Пытаемся найти canvas и получить его содержимое
             canvas_data = await page.evaluate("""
-                () => {
+                ({mimeType, quality}) => {
                     const canvas = document.querySelector('canvas');
                     if (canvas) {
                         try {
-                            return canvas.toDataURL('image/png');
+                            if (mimeType === 'image/png') {
+                                return canvas.toDataURL(mimeType);
+                            } else {
+                                return canvas.toDataURL(mimeType, quality);
+                            }
                         } catch (e) {
                             console.error('Error getting canvas data:', e);
                             return null;
@@ -62,7 +79,7 @@ class ImprovedTibetanScraper:
                     }
                     return null;
                 }
-            """)
+            """, {'mimeType': mime_type, 'quality': quality})
             return canvas_data
         except Exception as e:
             print(f"  ✗ Ошибка извлечения из canvas: {str(e)}")
@@ -115,9 +132,15 @@ class ImprovedTibetanScraper:
             # Находим область с изображением текста
             element = await page.query_selector('body')
             if element:
-                screenshot = await element.screenshot(type='png')
-                screenshot_b64 = base64.b64encode(screenshot).decode()
-                return (f"data:image/png;base64,{screenshot_b64}", 'screenshot')
+                # Создаем скриншот в нужном формате
+                if self.image_format == 'jpeg':
+                    screenshot = await element.screenshot(type='jpeg', quality=self.jpeg_quality)
+                    screenshot_b64 = base64.b64encode(screenshot).decode()
+                    return (f"data:image/jpeg;base64,{screenshot_b64}", 'screenshot')
+                else:
+                    screenshot = await element.screenshot(type='png')
+                    screenshot_b64 = base64.b64encode(screenshot).decode()
+                    return (f"data:image/png;base64,{screenshot_b64}", 'screenshot')
         except Exception as e:
             print(f"  ✗ Ошибка создания скриншота: {str(e)}")
         
@@ -299,8 +322,8 @@ class ImprovedTibetanScraper:
             print(f"→ Обработка страницы: {page_id}")
             print(f"{'='*60}")
             
-            # Формируем URL
-            url = f"{self.base_url}index.html?kdb=degekangyur&sutra=d1&page={page_id}"
+            # Формируем URL с параметрами каталога и сутры
+            url = f"{self.base_url}index.html?kdb={self.kdb}&sutra={self.sutra}&page={page_id}"
             print(f"  URL: {url}")
             
             # Переходим на страницу
@@ -315,7 +338,9 @@ class ImprovedTibetanScraper:
             image_result = await self.find_page_image(page, page_id)
             
             image_saved = False
-            image_filename = f"{page_id}.png"
+            # Определяем расширение файла в зависимости от формата
+            file_extension = 'jpg' if self.image_format == 'jpeg' else 'png'
+            image_filename = f"{page_id}.{file_extension}"
             image_source = None
             
             if image_result:
@@ -402,7 +427,10 @@ class ImprovedTibetanScraper:
         print(f"# ПАРСЕР ТИБЕТСКИХ ТЕКСТОВ")
         print(f"{'#'*60}")
         print(f"Количество страниц: {len(page_ids)}")
+        print(f"Каталог: {self.kdb}, Сутра: {self.sutra}")
         print(f"Директория вывода: {self.output_dir.absolute()}")
+        print(f"Формат изображений: {self.image_format.upper()}" + 
+              (f" (качество: {self.jpeg_quality}%)" if self.image_format == 'jpeg' else ""))
         print(f"Режим браузера: {'headless' if headless else 'visible'}")
         print(f"{'#'*60}\n")
         
@@ -474,19 +502,36 @@ async def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Примеры использования:
-  # Тест на одной странице
+  # Тест на одной странице (каталог по умолчанию - degekangyur)
   python improved_parser.py --pages 1-1b
   
-  # Парсинг первых 10 страниц
-  python improved_parser.py --start-page 1 --end-page 5
+  # Парсинг из каталога degetengyur, сутра D1109
+  python improved_parser.py --kdb degetengyur --sutra D1109 --pages 1-1b
+  
+  # Парсинг с сохранением в JPEG (меньше размер)
+  python improved_parser.py --pages 1-1b --image-format jpeg
+  
+  # JPEG с качеством 85% (еще меньше размер)
+  python improved_parser.py --pages 1-1b --image-format jpeg --jpeg-quality 85
+  
+  # Парсинг первых 10 страниц из другого каталога в JPEG
+  python improved_parser.py --kdb degetengyur --sutra D1109 --start-page 1 --end-page 5 --image-format jpeg
   
   # Парсинг с видимым браузером (для отладки)
-  python improved_parser.py --pages 1-1b --no-headless
+  python improved_parser.py --kdb degetengyur --sutra D1109 --pages 1-1b --no-headless
         """
     )
     
     parser.add_argument('--output', '-o', default='tibetan_data', 
                        help='Директория для сохранения данных')
+    parser.add_argument('--kdb', default='degekangyur',
+                       help='Каталог (например: degekangyur, degetengyur)')
+    parser.add_argument('--sutra', default='d1',
+                       help='Сутра (например: d1, D1109)')
+    parser.add_argument('--image-format', choices=['png', 'jpeg'], default='png',
+                       help='Формат изображений: png или jpeg (по умолчанию: png)')
+    parser.add_argument('--jpeg-quality', type=int, default=95, 
+                       help='Качество JPEG от 1 до 100 (по умолчанию: 95)')
     parser.add_argument('--start-vol', type=int, default=1, 
                        help='Начальный том (по умолчанию: 1)')
     parser.add_argument('--end-vol', type=int, default=1, 
@@ -504,7 +549,13 @@ async def main():
     
     args = parser.parse_args()
     
-    scraper = ImprovedTibetanScraper(output_dir=args.output)
+    scraper = ImprovedTibetanScraper(
+        output_dir=args.output, 
+        kdb=args.kdb, 
+        sutra=args.sutra,
+        image_format=args.image_format,
+        jpeg_quality=args.jpeg_quality
+    )
     
     if args.pages:
         page_ids = args.pages
