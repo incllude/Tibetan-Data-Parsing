@@ -55,8 +55,45 @@ class ImprovedTibetanScraper:
             except Exception:
                 print(f"  ⚠ Canvas/изображение не появились в течение 15 сек")
             
+            # Прокручиваем страницу для загрузки lazy-loaded изображений
+            try:
+                print(f"  → Загрузка lazy-loaded изображений...")
+                
+                # Триггерим загрузку всех lazy images
+                await page.evaluate("""
+                    () => {
+                        // Прокручиваем постепенно для триггера всех lazy loaders
+                        window.scrollTo(0, document.body.scrollHeight / 2);
+                    }
+                """)
+                await page.wait_for_timeout(1500)
+                
+                await page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
+                await page.wait_for_timeout(3000)  # Увеличено время ожидания
+                
+                await page.evaluate('window.scrollTo(0, 0)')
+                await page.wait_for_timeout(2000)  # Увеличено время ожидания
+                
+                # Пытаемся форсировать загрузку lazy images
+                await page.evaluate("""
+                    () => {
+                        const lazyImages = document.querySelectorAll('img.lazy');
+                        lazyImages.forEach(img => {
+                            if (img.dataset.src) {
+                                img.src = img.dataset.src;
+                            }
+                            // Триггерим событие для lazy loader
+                            img.dispatchEvent(new Event('load'));
+                        });
+                    }
+                """)
+                await page.wait_for_timeout(2000)
+                
+            except Exception as e:
+                print(f"  ⚠ Ошибка прокрутки страницы: {str(e)}")
+            
             # Дополнительное время для рендеринга
-            await page.wait_for_timeout(5000)
+            await page.wait_for_timeout(2000)
         except Exception as e:
             print(f"  ⚠ Таймаут ожидания загрузки: {str(e)}")
     
@@ -110,24 +147,79 @@ class ImprovedTibetanScraper:
             img_src = await page.evaluate("""
                 (pageId) => {
                     const images = document.querySelectorAll('img');
+                    console.log(`Всего найдено изображений: ${images.length}`);
+                    
+                    // Создаем разные варианты pageId для поиска
+                    // Например: "3-1b" -> ["3-1b", "31b", "3-1-1b"]
+                    const searchPatterns = [pageId];
+                    
+                    // Убираем дефисы
+                    searchPatterns.push(pageId.replace(/-/g, ''));
+                    
+                    // Преобразуем формат {vol}-{page}{side} в {vol}-{page}-{page}{side}
+                    const parts = pageId.split('-');
+                    if (parts.length === 2) {
+                        const vol = parts[0];
+                        const pageMatch = parts[1].match(/^(\\d+)([ab])$/);
+                        if (pageMatch) {
+                            const pageNum = pageMatch[1];
+                            const pageSide = pageMatch[2];
+                            // "3-1b" -> "3-1-1b"
+                            searchPatterns.push(`${vol}-${pageNum}-${pageNum}${pageSide}`);
+                            // Также без дефисов
+                            searchPatterns.push(`${vol}${pageNum}${pageNum}${pageSide}`);
+                        }
+                    }
+                    
+                    console.log(`Паттерны для поиска:`, searchPatterns);
+                    
+                    // Логируем первые несколько изображений для debug
+                    images.forEach((img, idx) => {
+                        if (idx < 5) {
+                            console.log(`Image ${idx}: src="${img.src || 'none'}", class="${img.className}", width=${img.width}, height=${img.height}, parent="${img.parentElement?.className || 'none'}"`);
+                        }
+                    });
+                    
+                    // Ищем изображение по всем паттернам
                     for (const img of images) {
                         const src = img.src || img.dataset.src || '';
-                        // Проверяем различные варианты совпадения
-                        if (src && (
-                            src.includes(pageId) || 
-                            src.includes(pageId.replace('-', '')) ||
-                            img.alt === pageId ||
-                            img.id === pageId
-                        )) {
+                        const alt = img.alt || '';
+                        const id = img.id || '';
+                        
+                        for (const pattern of searchPatterns) {
+                            if (src.includes(pattern) || alt === pattern || id === pattern) {
+                                console.log(`✓ Найдено изображение по паттерну ${pattern}: ${src}`);
+                                return img.src;
+                            }
+                        }
+                    }
+                    
+                    // Если не нашли конкретное, ищем img с классом image-pb или lazy
+                    for (const img of images) {
+                        const parent = img.parentElement;
+                        if (parent && parent.classList.contains('image-pb')) {
+                            console.log('✓ Найдено изображение в image-pb:', img.src);
                             return img.src;
                         }
                     }
-                    // Если не нашли конкретное изображение, берем первое крупное
+                    
+                    // Если не нашли, берем первое крупное изображение с классом lazy
+                    for (const img of images) {
+                        if (img.classList.contains('lazy') && img.width > 300 && img.height > 300) {
+                            console.log('✓ Найдено lazy изображение:', img.src);
+                            return img.src;
+                        }
+                    }
+                    
+                    // Последняя попытка: любое крупное изображение
                     for (const img of images) {
                         if (img.width > 300 && img.height > 300) {
+                            console.log('✓ Найдено крупное изображение:', img.src);
                             return img.src;
                         }
                     }
+                    
+                    console.log('✗ Не найдено ни одного подходящего изображения');
                     return null;
                 }
             """, page_id)
@@ -486,6 +578,9 @@ class ImprovedTibetanScraper:
                 user_agent='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
             )
             page = await context.new_page()
+            
+            # Включаем вывод console.log из браузера
+            page.on("console", lambda msg: print(f"  [Browser] {msg.text}"))
             
             async with aiohttp.ClientSession() as session:
                 success_count = 0
