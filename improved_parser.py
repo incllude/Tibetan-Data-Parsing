@@ -40,13 +40,22 @@ class ImprovedTibetanScraper:
         self.jpeg_quality = jpeg_quality  # Качество JPEG (1-100)
         self.metadata = []
         
-    async def wait_for_page_load(self, page: Page, timeout: int = 10000):
-        """Ожидание полной загрузки страницы"""
+    async def wait_for_page_load(self, page: Page, timeout: int = 30000):
+        """Ожидание полной загрузки страницы с проверкой контента"""
         try:
             # Ждем загрузки основного контента
             await page.wait_for_load_state('networkidle', timeout=timeout)
+            
+            # Ждем появления canvas или изображения (признак того, что контент загрузился)
+            try:
+                await page.wait_for_selector('canvas, img[src*="jpg"], img[src*="png"]', 
+                                             timeout=15000, state='visible')
+                print(f"  ✓ Контент загружен")
+            except Exception:
+                print(f"  ⚠ Canvas/изображение не появились в течение 15 сек")
+            
             # Дополнительное время для рендеринга
-            await page.wait_for_timeout(3000)
+            await page.wait_for_timeout(5000)
         except Exception as e:
             print(f"  ⚠ Таймаут ожидания загрузки: {str(e)}")
     
@@ -313,92 +322,126 @@ class ImprovedTibetanScraper:
             json.dump(self.metadata, f, ensure_ascii=False, indent=2)
         print(f"\n✓ Метаданные сохранены: {len(self.metadata)} записей")
     
-    async def scrape_page(self, page: Page, session: aiohttp.ClientSession, page_id: str) -> bool:
+    async def scrape_page(self, page: Page, session: aiohttp.ClientSession, page_id: str, 
+                         max_retries: int = 3) -> bool:
         """
-        Парсинг одной страницы
+        Парсинг одной страницы с механизмом повторных попыток
         """
-        try:
-            print(f"\n{'='*60}")
-            print(f"→ Обработка страницы: {page_id}")
-            print(f"{'='*60}")
-            
-            # Формируем URL с параметрами каталога и сутры
-            url = f"{self.base_url}index.html?kdb={self.kdb}&sutra={self.sutra}&page={page_id}"
-            print(f"  URL: {url}")
-            
-            # Переходим на страницу
-            await page.goto(url, wait_until='domcontentloaded', timeout=30000)
-            await self.wait_for_page_load(page)
-            
-            # Сохраняем HTML для отладки
-            await self.save_page_html(page, page_id)
-            
-            # Извлекаем изображение
-            print(f"\n  → Поиск изображения...")
-            image_result = await self.find_page_image(page, page_id)
-            
-            image_saved = False
-            # Определяем расширение файла в зависимости от формата
-            file_extension = 'jpg' if self.image_format == 'jpeg' else 'png'
-            image_filename = f"{page_id}.{file_extension}"
-            image_source = None
-            
-            if image_result:
-                image_data, source_type = image_result
-                image_source = source_type
-                print(f"  ℹ Источник изображения: {source_type}")
+        for attempt in range(1, max_retries + 1):
+            try:
+                if attempt > 1:
+                    print(f"\n  🔄 Попытка {attempt}/{max_retries}")
+                    await asyncio.sleep(5)  # Пауза перед повторной попыткой
                 
-                if source_type == 'img' and not image_data.startswith('data:'):
-                    # Это URL, нужно скачать
-                    full_url = urljoin(self.base_url, image_data)
-                    image_saved = await self.download_image_url(session, full_url, image_filename)
+                print(f"\n{'='*60}")
+                print(f"→ Обработка страницы: {page_id}")
+                print(f"{'='*60}")
+                
+                # Формируем URL с параметрами каталога и сутры
+                url = f"{self.base_url}index.html?kdb={self.kdb}&sutra={self.sutra}&page={page_id}"
+                print(f"  URL: {url}")
+                
+                # Переходим на страницу с увеличенным timeout
+                await page.goto(url, wait_until='domcontentloaded', timeout=60000)
+                await self.wait_for_page_load(page)
+            
+                # Сохраняем HTML для отладки
+                await self.save_page_html(page, page_id)
+                
+                # Извлекаем изображение
+                print(f"\n  → Поиск изображения...")
+                image_result = await self.find_page_image(page, page_id)
+                
+                image_saved = False
+                # Определяем расширение файла в зависимости от формата
+                file_extension = 'jpg' if self.image_format == 'jpeg' else 'png'
+                image_filename = f"{page_id}.{file_extension}"
+                image_source = None
+                
+                if image_result:
+                    image_data, source_type = image_result
+                    image_source = source_type
+                    print(f"  ℹ Источник изображения: {source_type}")
+                    
+                    # Проверяем что это не просто пустой скриншот
+                    if source_type == 'screenshot':
+                        print(f"  ⚠ Получен скриншот вместо canvas/img - возможно страница не загрузилась")
+                        # Если это первая попытка, пробуем еще раз
+                        if attempt < max_retries:
+                            continue
+                    
+                    if source_type == 'img' and not image_data.startswith('data:'):
+                        # Это URL, нужно скачать
+                        full_url = urljoin(self.base_url, image_data)
+                        image_saved = await self.download_image_url(session, full_url, image_filename)
+                    else:
+                        # Это data URL или уже готовые данные
+                        image_saved = self.save_image(image_data, image_filename)
                 else:
-                    # Это data URL или уже готовые данные
-                    image_saved = self.save_image(image_data, image_filename)
-            else:
-                print(f"  ✗ Изображение не найдено")
-            
-            # Извлекаем текст
-            print(f"\n  → Поиск текста...")
-            text = await self.extract_tibetan_text(page, page_id)
-            
-            text_saved = False
-            if text:
-                # Показываем превью текста
-                preview = text[:150] + "..." if len(text) > 150 else text
-                print(f"  ℹ Превью: {preview}")
-                text_saved = self.save_text(page_id, text)
-            else:
-                print(f"  ✗ Текст не найден")
-            
-            # Сохраняем метаданные
-            metadata_entry = {
-                'page_id': page_id,
-                'image_file': image_filename if image_saved else None,
-                'image_source': image_source,
-                'text_file': f"{page_id}.txt" if text_saved else None,
-                'text_length': len(text) if text else 0,
-                'text_preview': text[:200] if text else None,
-                'url': url,
-                'scraped_at': datetime.now().isoformat(),
-                'success': image_saved or text_saved
-            }
-            self.metadata.append(metadata_entry)
-            
-            success = image_saved and text_saved
-            
-            if success:
-                print(f"\n  ✅ Страница успешно обработана")
-            else:
-                print(f"\n  ⚠ Страница обработана частично")
-            
-            return success
-            
-        except Exception as e:
-            print(f"\n  ✗ Критическая ошибка: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            return False
+                    print(f"  ✗ Изображение не найдено")
+                    if attempt < max_retries:
+                        continue
+                
+                # Извлекаем текст
+                print(f"\n  → Поиск текста...")
+                text = await self.extract_tibetan_text(page, page_id)
+                
+                text_saved = False
+                if text:
+                    # Показываем превью текста
+                    preview = text[:150] + "..." if len(text) > 150 else text
+                    print(f"  ℹ Превью: {preview}")
+                    text_saved = self.save_text(page_id, text)
+                else:
+                    print(f"  ✗ Текст не найден")
+                    # Если нет ни изображения ни текста, пробуем еще раз
+                    if not image_saved and attempt < max_retries:
+                        continue
+                
+                # Сохраняем метаданные
+                metadata_entry = {
+                    'page_id': page_id,
+                    'image_file': image_filename if image_saved else None,
+                    'image_source': image_source,
+                    'text_file': f"{page_id}.txt" if text_saved else None,
+                    'text_length': len(text) if text else 0,
+                    'text_preview': text[:200] if text else None,
+                    'url': url,
+                    'scraped_at': datetime.now().isoformat(),
+                    'success': image_saved or text_saved,
+                    'attempts': attempt
+                }
+                self.metadata.append(metadata_entry)
+                
+                success = image_saved and text_saved
+                
+                if success:
+                    print(f"\n  ✅ Страница успешно обработана")
+                    return True
+                elif image_saved or text_saved:
+                    print(f"\n  ⚠ Страница обработана частично")
+                    return False
+                else:
+                    # Ничего не получили, пробуем еще раз
+                    if attempt < max_retries:
+                        print(f"\n  ⚠ Ничего не получено, повторная попытка...")
+                        continue
+                    else:
+                        print(f"\n  ✗ Не удалось получить данные после {max_retries} попыток")
+                        return False
+                
+            except Exception as e:
+                print(f"\n  ✗ Ошибка при обработке (попытка {attempt}/{max_retries}): {str(e)}")
+                if attempt < max_retries:
+                    import traceback
+                    traceback.print_exc()
+                    continue
+                else:
+                    import traceback
+                    traceback.print_exc()
+                    return False
+        
+        return False
     
     def generate_page_ids(self, start_vol: int, end_vol: int, start_page: int, end_page: int) -> List[str]:
         """
