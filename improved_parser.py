@@ -21,7 +21,7 @@ class ImprovedTibetanScraper:
     """Улучшенный парсер с точным сопоставлением изображений и текстов"""
     
     def __init__(self, output_dir: str = "tibetan_data", kdb: str = "degekangyur", sutra: str = "d1",
-                 image_format: str = "png", jpeg_quality: int = 95):
+                 image_format: str = "png", jpeg_quality: int = 95, delay_between_pages: float = 2.0):
         self.output_dir = Path(output_dir)
         self.images_dir = self.output_dir / "images"
         self.texts_dir = self.output_dir / "texts"
@@ -38,6 +38,7 @@ class ImprovedTibetanScraper:
         self.sutra = sutra  # Сутра (d1, D1109 и т.д.)
         self.image_format = image_format.lower()  # 'png' или 'jpeg'
         self.jpeg_quality = jpeg_quality  # Качество JPEG (1-100)
+        self.delay_between_pages = delay_between_pages  # Задержка между запросами (секунды)
         self.metadata = []
         
     async def wait_for_page_load(self, page: Page, timeout: int = 30000):
@@ -475,6 +476,7 @@ class ImprovedTibetanScraper:
         print(f"Формат изображений: {self.image_format.upper()}" + 
               (f" (качество: {self.jpeg_quality}%)" if self.image_format == 'jpeg' else ""))
         print(f"Режим браузера: {'headless' if headless else 'visible'}")
+        print(f"Задержка между страницами: {self.delay_between_pages} сек")
         print(f"{'#'*60}\n")
         
         async with async_playwright() as p:
@@ -506,7 +508,7 @@ class ImprovedTibetanScraper:
                                 fail_count += 1
                         
                         # Пауза между запросами
-                        await asyncio.sleep(2)
+                        await asyncio.sleep(self.delay_between_pages)
                         
                     except KeyboardInterrupt:
                         print("\n\n⚠ Прервано пользователем")
@@ -575,6 +577,8 @@ async def main():
                        help='Формат изображений: png или jpeg (по умолчанию: png)')
     parser.add_argument('--jpeg-quality', type=int, default=95, 
                        help='Качество JPEG от 1 до 100 (по умолчанию: 95)')
+    parser.add_argument('--delay', type=float, default=2.0,
+                       help='Задержка между запросами страниц в секундах (по умолчанию: 2.0)')
     parser.add_argument('--start-vol', type=int, default=1, 
                        help='Начальный том (по умолчанию: 1)')
     parser.add_argument('--end-vol', type=int, default=1, 
@@ -597,7 +601,8 @@ async def main():
         kdb=args.kdb, 
         sutra=args.sutra,
         image_format=args.image_format,
-        jpeg_quality=args.jpeg_quality
+        jpeg_quality=args.jpeg_quality,
+        delay_between_pages=args.delay
     )
     
     if args.pages:
