@@ -23,7 +23,7 @@ class ImprovedTibetanScraper:
     def __init__(self, output_dir: str = "tibetan_data", kdb: str = "degekangyur", sutra: str = "d1",
                  image_format: str = "png", jpeg_quality: int = 95, delay_between_pages: float = 2.0,
                  volume_sutras: Optional[Dict[int, str]] = None, auto_sutra: bool = False, 
-                 max_sutra_attempts: int = 10):
+                 max_sutra_attempts: int = 10, max_failed_pages: int = 5):
         self.output_dir = Path(output_dir)
         self.images_dir = self.output_dir / "images"
         self.texts_dir = self.output_dir / "texts"
@@ -44,8 +44,13 @@ class ImprovedTibetanScraper:
         self.image_format = image_format.lower()  # 'png' или 'jpeg'
         self.jpeg_quality = jpeg_quality  # Качество JPEG (1-100)
         self.delay_between_pages = delay_between_pages  # Задержка между запросами (секунды)
+        self.max_failed_pages = max_failed_pages  # Максимальное количество неудачных страниц подряд перед переходом к следующему volume
         self.metadata = []
         self.last_successful_sutra = sutra  # Последняя успешно найденная sutra (для оптимизации автоподбора)
+        
+        # Отслеживание неудачных попыток для автоматического пропуска volume
+        self.current_volume = None
+        self.failed_pages_in_volume = 0
     
     def get_sutra_for_volume(self, volume: int) -> str:
         """Получить sutra для конкретного volume, используя mapping или значение по умолчанию"""
@@ -702,6 +707,7 @@ class ImprovedTibetanScraper:
               (f" (качество: {self.jpeg_quality}%)" if self.image_format == 'jpeg' else ""))
         print(f"Режим браузера: {'headless' if headless else 'visible'}")
         print(f"Задержка между страницами: {self.delay_between_pages} сек")
+        print(f"Лимит неудач для пропуска volume: {self.max_failed_pages} страниц")
         print(f"{'#'*60}\n")
         
         async with async_playwright() as p:
@@ -720,7 +726,25 @@ class ImprovedTibetanScraper:
                 partial_count = 0
                 fail_count = 0
                 
+                skip_until_next_volume = False
+                skipped_count = 0
+                
                 for i, page_id in enumerate(page_ids, 1):
+                    # Определяем текущий volume
+                    volume = int(page_id.split('-')[0])
+                    
+                    # Проверяем, нужно ли сбросить счетчик неудач при переходе на новый volume
+                    if self.current_volume != volume:
+                        self.current_volume = volume
+                        self.failed_pages_in_volume = 0
+                        skip_until_next_volume = False  # Новый volume - пробуем снова
+                    
+                    # Если достигнут лимит неудач для этого volume, пропускаем оставшиеся страницы
+                    if skip_until_next_volume:
+                        print(f"\n[{i}/{len(page_ids)}] ⏭ Пропущена страница {page_id} (volume {volume} пропускается)")
+                        skipped_count += 1
+                        continue
+                    
                     print(f"\n[{i}/{len(page_ids)}]")
                     
                     try:
@@ -728,12 +752,21 @@ class ImprovedTibetanScraper:
                         
                         if success:
                             success_count += 1
+                            self.failed_pages_in_volume = 0  # Сбрасываем счетчик при успехе
                         else:
                             # Проверяем был ли хоть какой-то успех
                             if self.metadata and self.metadata[-1].get('success'):
                                 partial_count += 1
+                                self.failed_pages_in_volume = 0  # Частичный успех тоже считается
                             else:
                                 fail_count += 1
+                                self.failed_pages_in_volume += 1
+                                
+                                # Проверяем, достигнут ли лимит неудач
+                                if self.failed_pages_in_volume >= self.max_failed_pages:
+                                    print(f"\n  ⚠ Достигнут лимит неудач ({self.max_failed_pages}) для volume {volume}")
+                                    print(f"  ⏭ Пропускаем оставшиеся страницы volume {volume}, переход к следующему volume")
+                                    skip_until_next_volume = True
                         
                         # Пауза между запросами
                         await asyncio.sleep(self.delay_between_pages)
@@ -744,6 +777,13 @@ class ImprovedTibetanScraper:
                     except Exception as e:
                         print(f"\n  ✗ Необработанная ошибка: {str(e)}")
                         fail_count += 1
+                        self.failed_pages_in_volume += 1
+                        
+                        # Проверяем лимит неудач и при исключениях
+                        if self.failed_pages_in_volume >= self.max_failed_pages:
+                            print(f"\n  ⚠ Достигнут лимит неудач ({self.max_failed_pages}) для volume {volume}")
+                            print(f"  ⏭ Пропускаем оставшиеся страницы volume {volume}, переход к следующему volume")
+                            skip_until_next_volume = True
                         continue
                 
                 # Сохраняем метаданные
@@ -759,6 +799,8 @@ class ImprovedTibetanScraper:
         print(f"✅ Полностью успешно: {success_count}")
         print(f"⚠ Частично успешно: {partial_count}")
         print(f"✗ Неудачно: {fail_count}")
+        if skipped_count > 0:
+            print(f"⏭ Пропущено (лимит неудач): {skipped_count}")
         print(f"\nДанные сохранены в: {self.output_dir.absolute()}")
         print(f"  - Изображения: {self.images_dir}")
         print(f"  - Тексты: {self.texts_dir}")
@@ -816,6 +858,8 @@ async def main():
                        help='Автоматический подбор sutra для каждого volume (инкремент числа при неудачах)')
     parser.add_argument('--max-sutra-attempts', type=int, default=10,
                        help='Максимальное количество попыток инкремента sutra (по умолчанию: 10)')
+    parser.add_argument('--max-failed-pages', type=int, default=5,
+                       help='Максимальное количество неудачных страниц подряд перед пропуском volume (по умолчанию: 5)')
     parser.add_argument('--image-format', choices=['png', 'jpeg'], default='png',
                        help='Формат изображений: png или jpeg (по умолчанию: png)')
     parser.add_argument('--jpeg-quality', type=int, default=95, 
@@ -860,7 +904,8 @@ async def main():
         delay_between_pages=args.delay,
         volume_sutras=volume_sutras,
         auto_sutra=args.auto_sutra,
-        max_sutra_attempts=args.max_sutra_attempts
+        max_sutra_attempts=args.max_sutra_attempts,
+        max_failed_pages=args.max_failed_pages
     )
     
     if args.pages:
