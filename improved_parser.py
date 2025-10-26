@@ -21,7 +21,9 @@ class ImprovedTibetanScraper:
     """Улучшенный парсер с точным сопоставлением изображений и текстов"""
     
     def __init__(self, output_dir: str = "tibetan_data", kdb: str = "degekangyur", sutra: str = "d1",
-                 image_format: str = "png", jpeg_quality: int = 95, delay_between_pages: float = 2.0):
+                 image_format: str = "png", jpeg_quality: int = 95, delay_between_pages: float = 2.0,
+                 volume_sutras: Optional[Dict[int, str]] = None, auto_sutra: bool = False, 
+                 max_sutra_attempts: int = 10):
         self.output_dir = Path(output_dir)
         self.images_dir = self.output_dir / "images"
         self.texts_dir = self.output_dir / "texts"
@@ -35,11 +37,42 @@ class ImprovedTibetanScraper:
         
         self.base_url = "https://online.adarshah.org/"
         self.kdb = kdb  # Каталог (degekangyur, degetengyur и т.д.)
-        self.sutra = sutra  # Сутра (d1, D1109 и т.д.)
+        self.sutra = sutra  # Сутра по умолчанию (d1, D1109 и т.д.)
+        self.volume_sutras = volume_sutras or {}  # Сопоставление volume -> sutra
+        self.auto_sutra = auto_sutra  # Автоматический подбор sutra
+        self.max_sutra_attempts = max_sutra_attempts  # Максимальное количество попыток инкремента sutra
         self.image_format = image_format.lower()  # 'png' или 'jpeg'
         self.jpeg_quality = jpeg_quality  # Качество JPEG (1-100)
         self.delay_between_pages = delay_between_pages  # Задержка между запросами (секунды)
         self.metadata = []
+        self.last_successful_sutra = sutra  # Последняя успешно найденная sutra (для оптимизации автоподбора)
+    
+    def get_sutra_for_volume(self, volume: int) -> str:
+        """Получить sutra для конкретного volume, используя mapping или значение по умолчанию"""
+        return self.volume_sutras.get(volume, self.sutra)
+    
+    def increment_sutra(self, sutra: str) -> str:
+        """
+        Увеличить числовую часть sutra на 1
+        Примеры: d1 -> d2, D1109 -> D1110, d999 -> d1000
+        """
+        import re
+        # Ищем числовую часть в конце строки
+        match = re.match(r'^([^\d]*)(\d+)$', sutra)
+        if match:
+            prefix = match.group(1)
+            number = int(match.group(2))
+            return f"{prefix}{number + 1}"
+        else:
+            # Если не найдено число, возвращаем исходное значение
+            print(f"  ⚠ Не удалось извлечь число из sutra: {sutra}")
+            return sutra
+    
+    def parse_sutra_number(self, sutra: str) -> Optional[int]:
+        """Извлечь числовую часть из sutra"""
+        import re
+        match = re.search(r'(\d+)$', sutra)
+        return int(match.group(1)) if match else None
         
     async def wait_for_page_load(self, page: Page, timeout: int = 30000):
         """Ожидание полной загрузки страницы с проверкой контента"""
@@ -415,11 +448,81 @@ class ImprovedTibetanScraper:
             json.dump(self.metadata, f, ensure_ascii=False, indent=2)
         print(f"\n✓ Метаданные сохранены: {len(self.metadata)} записей")
     
+    async def auto_detect_sutra_for_volume(self, page: Page, session: aiohttp.ClientSession, 
+                                           volume: int) -> Optional[str]:
+        """
+        Автоматический подбор sutra для volume путем попыток загрузки первой страницы
+        Возвращает найденную sutra или None если не найдена
+        """
+        print(f"\n  🔍 Автоподбор sutra для volume {volume}...")
+        
+        # Начинаем с последней успешной sutra (оптимизация: sutra обычно растут с volume)
+        # Если для этого volume уже есть предустановленная sutra, используем её
+        if volume in self.volume_sutras:
+            current_sutra = self.volume_sutras[volume]
+            print(f"  ℹ Используем предустановленную sutra для volume {volume}: {current_sutra}")
+        else:
+            current_sutra = self.last_successful_sutra
+            print(f"  ℹ Начинаем с последней успешной sutra: {current_sutra}")
+        
+        page_id = f"{volume}-1b"  # Первая страница тома
+        
+        for attempt in range(self.max_sutra_attempts):
+            try:
+                url = f"{self.base_url}index.html?kdb={self.kdb}&sutra={current_sutra}&page={page_id}"
+                print(f"  → Попытка {attempt + 1}/{self.max_sutra_attempts}: sutra={current_sutra}")
+                
+                # Пытаемся загрузить страницу
+                await page.goto(url, wait_until='domcontentloaded', timeout=30000)
+                await asyncio.sleep(2)
+                
+                # Пробуем найти изображение (строгая проверка)
+                image_result = await self.find_page_image(page, page_id)
+                
+                # ВАЖНО: Принимаем только реальные изображения (canvas или img), НЕ screenshot
+                if image_result:
+                    image_data, source_type = image_result
+                    
+                    # Проверяем что это реальное изображение, а не скриншот
+                    if source_type in ['canvas', 'img']:
+                        print(f"  ✅ Найдена рабочая sutra: {current_sutra} (источник: {source_type})")
+                        # Сохраняем найденную sutra для этого volume
+                        self.volume_sutras[volume] = current_sutra
+                        # Обновляем последнюю успешную sutra для оптимизации следующих volume
+                        self.last_successful_sutra = current_sutra
+                        return current_sutra
+                    else:
+                        print(f"  ✗ Sutra {current_sutra} не подходит (получен только {source_type}, нужен canvas/img)")
+                else:
+                    print(f"  ✗ Sutra {current_sutra} не подходит (изображение не найдено)")
+                    
+            except Exception as e:
+                print(f"  ✗ Sutra {current_sutra} не подходит (ошибка: {str(e)[:50]}...)")
+            
+            # Увеличиваем sutra и пробуем снова
+            current_sutra = self.increment_sutra(current_sutra)
+            await asyncio.sleep(1)  # Небольшая пауза между попытками
+        
+        print(f"  ❌ Не удалось найти рабочую sutra после {self.max_sutra_attempts} попыток")
+        return None
+    
     async def scrape_page(self, page: Page, session: aiohttp.ClientSession, page_id: str, 
                          max_retries: int = 3) -> bool:
         """
         Парсинг одной страницы с механизмом повторных попыток
         """
+        # Извлекаем volume из page_id (формат: "volume-page{a/b}")
+        volume = int(page_id.split('-')[0])
+        
+        # Автоподбор sutra для первой страницы тома (если включен auto_sutra)
+        if self.auto_sutra and page_id == f"{volume}-1b" and volume not in self.volume_sutras:
+            detected_sutra = await self.auto_detect_sutra_for_volume(page, session, volume)
+            if detected_sutra is None:
+                print(f"\n  ❌ Не удалось автоматически определить sutra для volume {volume}")
+                print(f"  ℹ Используем последнюю успешную sutra ({self.last_successful_sutra}) для остальных страниц")
+                # Сохраняем последнюю успешную sutra для этого volume
+                self.volume_sutras[volume] = self.last_successful_sutra
+        
         for attempt in range(1, max_retries + 1):
             try:
                 if attempt > 1:
@@ -430,9 +533,15 @@ class ImprovedTibetanScraper:
                 print(f"→ Обработка страницы: {page_id}")
                 print(f"{'='*60}")
                 
+                # Получаем правильную sutra для этого volume
+                page_sutra = self.get_sutra_for_volume(volume)
+                
                 # Формируем URL с параметрами каталога и сутры
-                url = f"{self.base_url}index.html?kdb={self.kdb}&sutra={self.sutra}&page={page_id}"
+                url = f"{self.base_url}index.html?kdb={self.kdb}&sutra={page_sutra}&page={page_id}"
                 print(f"  URL: {url}")
+                print(f"  Volume: {volume}, Sutra: {page_sutra}")
+                if self.auto_sutra and volume in self.volume_sutras:
+                    print(f"  ℹ Sutra определена автоматически")
                 
                 # Переходим на страницу с увеличенным timeout
                 await page.goto(url, wait_until='domcontentloaded', timeout=60000)
@@ -540,12 +649,17 @@ class ImprovedTibetanScraper:
         """
         Генерация списка ID страниц
         Формат: {vol}-{page}{a/b}
+        Примечание: Страница {vol}-1a никогда не существует, поэтому начинаем с {vol}-1b
         """
         page_ids = []
         for vol in range(start_vol, end_vol + 1):
             for page_num in range(start_page, end_page + 1):
-                page_ids.append(f"{vol}-{page_num}a")
-                page_ids.append(f"{vol}-{page_num}b")
+                # Пропускаем страницу 1a для каждого volume - она никогда не существует
+                if page_num == 1:
+                    page_ids.append(f"{vol}-{page_num}b")  # Только 1b
+                else:
+                    page_ids.append(f"{vol}-{page_num}a")
+                    page_ids.append(f"{vol}-{page_num}b")
         return page_ids
     
     async def run(self, page_ids: Optional[List[str]] = None, max_pages: Optional[int] = None, 
@@ -563,7 +677,26 @@ class ImprovedTibetanScraper:
         print(f"# ПАРСЕР ТИБЕТСКИХ ТЕКСТОВ")
         print(f"{'#'*60}")
         print(f"Количество страниц: {len(page_ids)}")
-        print(f"Каталог: {self.kdb}, Сутра: {self.sutra}")
+        print(f"Каталог: {self.kdb}")
+        
+        # Информация о sutra
+        if self.auto_sutra:
+            print(f"Режим sutra: АВТОМАТИЧЕСКИЙ")
+            print(f"  Начальная sutra: {self.sutra}")
+            print(f"  Максимум попыток инкремента: {self.max_sutra_attempts}")
+            print(f"  Оптимизация: Продолжение с последней успешной sutra")
+            if self.volume_sutras:
+                print(f"  Предустановленные sutra:")
+                for vol, sutra in sorted(self.volume_sutras.items()):
+                    print(f"    Volume {vol}: {sutra}")
+        elif self.volume_sutras:
+            print(f"Сутры по volume:")
+            for vol, sutra in sorted(self.volume_sutras.items()):
+                print(f"  Volume {vol}: {sutra}")
+            print(f"Сутра по умолчанию: {self.sutra}")
+        else:
+            print(f"Сутра: {self.sutra}")
+        
         print(f"Директория вывода: {self.output_dir.absolute()}")
         print(f"Формат изображений: {self.image_format.upper()}" + 
               (f" (качество: {self.jpeg_quality}%)" if self.image_format == 'jpeg' else ""))
@@ -645,20 +778,29 @@ async def main():
   # Тест на одной странице (каталог по умолчанию - degekangyur)
   python improved_parser.py --pages 1-1b
   
-  # Парсинг из каталога degetengyur, сутра D1109
+  # АВТОМАТИЧЕСКИЙ ПОДБОР SUTRA (рекомендуется для массового парсинга!)
+  python improved_parser.py --auto-sutra --sutra d1 --start-vol 1 --end-vol 100 --start-page 1 --end-page 100
+  
+  # Автоподбор для degetengyur
+  python improved_parser.py --kdb degetengyur --auto-sutra --sutra D1109 --start-vol 1 --end-vol 50 --start-page 1 --end-page 100
+  
+  # Автоподбор с JPEG и увеличенным числом попыток
+  python improved_parser.py --auto-sutra --sutra d1 --max-sutra-attempts 20 --start-vol 1 --end-vol 100 --image-format jpeg --jpeg-quality 85
+  
+  # Ручное указание sutra для конкретных volumes
+  python improved_parser.py --volume-sutras 1:d1 2:d2 3:d3 --start-vol 1 --end-vol 3 --start-page 1 --end-page 100
+  
+  # Парсинг из каталога degetengyur с ручным указанием sutra
   python improved_parser.py --kdb degetengyur --sutra D1109 --pages 1-1b
   
-  # Парсинг с сохранением в JPEG (меньше размер)
-  python improved_parser.py --pages 1-1b --image-format jpeg
-  
-  # JPEG с качеством 85% (еще меньше размер)
-  python improved_parser.py --pages 1-1b --image-format jpeg --jpeg-quality 85
-  
-  # Парсинг первых 10 страниц из другого каталога в JPEG
-  python improved_parser.py --kdb degetengyur --sutra D1109 --start-page 1 --end-page 5 --image-format jpeg
-  
   # Парсинг с видимым браузером (для отладки)
-  python improved_parser.py --kdb degetengyur --sutra D1109 --pages 1-1b --no-headless
+  python improved_parser.py --auto-sutra --pages 1-1b --no-headless
+  
+Примечания:
+  - Страница 1-1a никогда не существует на сайте и будет автоматически пропущена
+  - --auto-sutra автоматически подбирает правильную sutra для каждого volume, инкрементируя число при неудачах
+  - При --auto-sutra программа пытается загрузить {volume}-1b с разными sutra (d1, d2, d3...) до успеха
+  - Максимальное число попыток инкремента задается через --max-sutra-attempts (по умолчанию 10)
         """
     )
     
@@ -667,7 +809,13 @@ async def main():
     parser.add_argument('--kdb', default='degekangyur',
                        help='Каталог (например: degekangyur, degetengyur)')
     parser.add_argument('--sutra', default='d1',
-                       help='Сутра (например: d1, D1109)')
+                       help='Сутра по умолчанию (например: d1, D1109)')
+    parser.add_argument('--volume-sutras', nargs='+', metavar='VOLUME:SUTRA',
+                       help='Сопоставление volume->sutra (например: 1:d1 2:d2 3:d3)')
+    parser.add_argument('--auto-sutra', action='store_true',
+                       help='Автоматический подбор sutra для каждого volume (инкремент числа при неудачах)')
+    parser.add_argument('--max-sutra-attempts', type=int, default=10,
+                       help='Максимальное количество попыток инкремента sutra (по умолчанию: 10)')
     parser.add_argument('--image-format', choices=['png', 'jpeg'], default='png',
                        help='Формат изображений: png или jpeg (по умолчанию: png)')
     parser.add_argument('--jpeg-quality', type=int, default=95, 
@@ -691,13 +839,28 @@ async def main():
     
     args = parser.parse_args()
     
+    # Парсим volume-sutras если предоставлены
+    volume_sutras = {}
+    if args.volume_sutras:
+        for mapping in args.volume_sutras:
+            try:
+                volume_str, sutra = mapping.split(':')
+                volume = int(volume_str)
+                volume_sutras[volume] = sutra
+            except ValueError:
+                print(f"⚠ Неверный формат volume-sutra: {mapping}. Ожидается формат VOLUME:SUTRA (например: 1:d1)")
+                continue
+    
     scraper = ImprovedTibetanScraper(
         output_dir=args.output, 
         kdb=args.kdb, 
         sutra=args.sutra,
         image_format=args.image_format,
         jpeg_quality=args.jpeg_quality,
-        delay_between_pages=args.delay
+        delay_between_pages=args.delay,
+        volume_sutras=volume_sutras,
+        auto_sutra=args.auto_sutra,
+        max_sutra_attempts=args.max_sutra_attempts
     )
     
     if args.pages:
