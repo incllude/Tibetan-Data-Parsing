@@ -9,6 +9,7 @@ import json
 import os
 import re
 import base64
+import time
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 from datetime import datetime
@@ -23,7 +24,7 @@ class ImprovedTibetanScraper:
     def __init__(self, output_dir: str = "tibetan_data", kdb: str = "degekangyur", sutra: str = "d1",
                  image_format: str = "png", jpeg_quality: int = 95, delay_between_pages: float = 2.0,
                  volume_sutras: Optional[Dict[int, str]] = None, auto_sutra: bool = False, 
-                 max_sutra_attempts: int = 10, max_failed_pages: int = 5):
+                 max_sutra_attempts: int = 10, max_failed_pages: int = 5, quiet_mode: bool = False):
         self.output_dir = Path(output_dir)
         self.images_dir = self.output_dir / "images"
         self.texts_dir = self.output_dir / "texts"
@@ -45,6 +46,7 @@ class ImprovedTibetanScraper:
         self.jpeg_quality = jpeg_quality  # Качество JPEG (1-100)
         self.delay_between_pages = delay_between_pages  # Задержка между запросами (секунды)
         self.max_failed_pages = max_failed_pages  # Максимальное количество неудачных страниц подряд перед переходом к следующему volume
+        self.quiet_mode = quiet_mode  # Тихий режим - выводить только ошибки и предупреждения
         self.metadata = []
         self.last_successful_sutra = sutra  # Последняя успешно найденная sutra (для оптимизации автоподбора)
         
@@ -54,7 +56,12 @@ class ImprovedTibetanScraper:
     
     def get_sutra_for_volume(self, volume: int) -> str:
         """Получить sutra для конкретного volume, используя mapping или значение по умолчанию"""
-        return self.volume_sutras.get(volume, self.sutra)
+        # Если включен auto_sutra, используем last_successful_sutra по умолчанию
+        # (если для volume еще не определена sutra)
+        if self.auto_sutra:
+            return self.volume_sutras.get(volume, self.last_successful_sutra)
+        else:
+            return self.volume_sutras.get(volume, self.sutra)
     
     def increment_sutra(self, sutra: str) -> str:
         """
@@ -89,13 +96,15 @@ class ImprovedTibetanScraper:
             try:
                 await page.wait_for_selector('canvas, img[src*="jpg"], img[src*="png"]', 
                                              timeout=15000, state='visible')
-                print(f"  ✓ Контент загружен")
+                if not self.quiet_mode:
+                    print(f"  ✓ Контент загружен")
             except Exception:
                 print(f"  ⚠ Canvas/изображение не появились в течение 15 сек")
             
             # Прокручиваем страницу для загрузки lazy-loaded изображений
             try:
-                print(f"  → Загрузка lazy-loaded изображений...")
+                if not self.quiet_mode:
+                    print(f"  → Загрузка lazy-loaded изображений...")
                 
                 # Триггерим загрузку всех lazy images
                 await page.evaluate("""
@@ -372,10 +381,11 @@ class ImprovedTibetanScraper:
             """, page_id)
             
             if text_data and text_data.get('text'):
-                print(f"  ℹ Метод извлечения: {text_data['method']}")
-                print(f"  ℹ JP ID: {text_data['jp_id']}")
-                if text_data.get('elements_found'):
-                    print(f"  ℹ Найдено элементов: {text_data['elements_found']}")
+                if not self.quiet_mode:
+                    print(f"  ℹ Метод извлечения: {text_data['method']}")
+                    print(f"  ℹ JP ID: {text_data['jp_id']}")
+                    if text_data.get('elements_found'):
+                        print(f"  ℹ Найдено элементов: {text_data['elements_found']}")
                 return text_data['text']
             
             return None
@@ -400,7 +410,8 @@ class ImprovedTibetanScraper:
                 with open(filepath, 'wb') as f:
                     f.write(image_data)
             
-            print(f"  ✓ Изображение сохранено: {filename}")
+            if not self.quiet_mode:
+                print(f"  ✓ Изображение сохранено: {filename}")
             return True
             
         except Exception as e:
@@ -416,7 +427,8 @@ class ImprovedTibetanScraper:
                     filepath = self.images_dir / filename
                     with open(filepath, 'wb') as f:
                         f.write(content)
-                    print(f"  ✓ Изображение загружено: {filename}")
+                    if not self.quiet_mode:
+                        print(f"  ✓ Изображение загружено: {filename}")
                     return True
                 else:
                     print(f"  ✗ Ошибка загрузки: статус {response.status}")
@@ -431,7 +443,8 @@ class ImprovedTibetanScraper:
             filepath = self.texts_dir / f"{page_id}.txt"
             with open(filepath, 'w', encoding='utf-8') as f:
                 f.write(text)
-            print(f"  ✓ Текст сохранен: {page_id}.txt ({len(text)} символов)")
+            if not self.quiet_mode:
+                print(f"  ✓ Текст сохранен: {page_id}.txt ({len(text)} символов)")
             return True
         except Exception as e:
             print(f"  ✗ Ошибка сохранения текста: {str(e)}")
@@ -459,15 +472,12 @@ class ImprovedTibetanScraper:
         Автоматический подбор sutra для volume путем попыток загрузки первой страницы
         Возвращает найденную sutra или None если не найдена
         """
-        print(f"\n  🔍 Автоподбор sutra для volume {volume}...")
+        if not self.quiet_mode:
+            print(f"\n  🔍 Автоподбор sutra для volume {volume}...")
         
         # Начинаем с последней успешной sutra (оптимизация: sutra обычно растут с volume)
-        # Если для этого volume уже есть предустановленная sutra, используем её
-        if volume in self.volume_sutras:
-            current_sutra = self.volume_sutras[volume]
-            print(f"  ℹ Используем предустановленную sutra для volume {volume}: {current_sutra}")
-        else:
-            current_sutra = self.last_successful_sutra
+        current_sutra = self.last_successful_sutra
+        if not self.quiet_mode:
             print(f"  ℹ Начинаем с последней успешной sutra: {current_sutra}")
         
         page_id = f"{volume}-1b"  # Первая страница тома
@@ -475,11 +485,12 @@ class ImprovedTibetanScraper:
         for attempt in range(self.max_sutra_attempts):
             try:
                 url = f"{self.base_url}index.html?kdb={self.kdb}&sutra={current_sutra}&page={page_id}"
-                print(f"  → Попытка {attempt + 1}/{self.max_sutra_attempts}: sutra={current_sutra}")
+                if not self.quiet_mode:
+                    print(f"  → Попытка {attempt + 1}/{self.max_sutra_attempts}: sutra={current_sutra}")
                 
                 # Пытаемся загрузить страницу
                 await page.goto(url, wait_until='domcontentloaded', timeout=30000)
-                await asyncio.sleep(2)
+                time.sleep(2)
                 
                 # Пробуем найти изображение (строгая проверка)
                 image_result = await self.find_page_image(page, page_id)
@@ -490,7 +501,8 @@ class ImprovedTibetanScraper:
                     
                     # Проверяем что это реальное изображение, а не скриншот
                     if source_type in ['canvas', 'img']:
-                        print(f"  ✅ Найдена рабочая sutra: {current_sutra} (источник: {source_type})")
+                        if not self.quiet_mode:
+                            print(f"  ✅ Найдена рабочая sutra: {current_sutra} (источник: {source_type})")
                         # Сохраняем найденную sutra для этого volume
                         self.volume_sutras[volume] = current_sutra
                         # Обновляем последнюю успешную sutra для оптимизации следующих volume
@@ -506,7 +518,7 @@ class ImprovedTibetanScraper:
             
             # Увеличиваем sutra и пробуем снова
             current_sutra = self.increment_sutra(current_sutra)
-            await asyncio.sleep(1)  # Небольшая пауза между попытками
+            time.sleep(1)  # Небольшая пауза между попытками
         
         print(f"  ❌ Не удалось найти рабочую sutra после {self.max_sutra_attempts} попыток")
         return None
@@ -520,11 +532,20 @@ class ImprovedTibetanScraper:
         volume = int(page_id.split('-')[0])
         
         # Автоподбор sutra для первой страницы тома (если включен auto_sutra)
-        if self.auto_sutra and page_id == f"{volume}-1b" and volume not in self.volume_sutras:
+        # При auto_sutra всегда запускаем автоподбор для первой страницы нового volume,
+        # игнорируя предустановленные volume_sutras
+        if self.auto_sutra and page_id == f"{volume}-1b":
+            # Удаляем предустановленную sutra если она есть, чтобы использовать last_successful_sutra
+            if volume in self.volume_sutras:
+                if not self.quiet_mode:
+                    print(f"  ℹ Игнорируем предустановленную sutra для volume {volume}, используем автоподбор")
+                del self.volume_sutras[volume]
+            
             detected_sutra = await self.auto_detect_sutra_for_volume(page, session, volume)
             if detected_sutra is None:
                 print(f"\n  ❌ Не удалось автоматически определить sutra для volume {volume}")
-                print(f"  ℹ Используем последнюю успешную sutra ({self.last_successful_sutra}) для остальных страниц")
+                if not self.quiet_mode:
+                    print(f"  ℹ Используем последнюю успешную sutra ({self.last_successful_sutra}) для остальных страниц")
                 # Сохраняем последнюю успешную sutra для этого volume
                 self.volume_sutras[volume] = self.last_successful_sutra
         
@@ -532,21 +553,23 @@ class ImprovedTibetanScraper:
             try:
                 if attempt > 1:
                     print(f"\n  🔄 Попытка {attempt}/{max_retries}")
-                    await asyncio.sleep(5)  # Пауза перед повторной попыткой
+                    time.sleep(5)  # Пауза перед повторной попыткой
                 
-                print(f"\n{'='*60}")
-                print(f"→ Обработка страницы: {page_id}")
-                print(f"{'='*60}")
+                if not self.quiet_mode:
+                    print(f"\n{'='*60}")
+                    print(f"→ Обработка страницы: {page_id}")
+                    print(f"{'='*60}")
                 
                 # Получаем правильную sutra для этого volume
                 page_sutra = self.get_sutra_for_volume(volume)
                 
                 # Формируем URL с параметрами каталога и сутры
                 url = f"{self.base_url}index.html?kdb={self.kdb}&sutra={page_sutra}&page={page_id}"
-                print(f"  URL: {url}")
-                print(f"  Volume: {volume}, Sutra: {page_sutra}")
-                if self.auto_sutra and volume in self.volume_sutras:
-                    print(f"  ℹ Sutra определена автоматически")
+                if not self.quiet_mode:
+                    print(f"  URL: {url}")
+                    print(f"  Volume: {volume}, Sutra: {page_sutra}")
+                    if self.auto_sutra and volume in self.volume_sutras:
+                        print(f"  ℹ Sutra определена автоматически")
                 
                 # Переходим на страницу с увеличенным timeout
                 await page.goto(url, wait_until='domcontentloaded', timeout=60000)
@@ -556,7 +579,8 @@ class ImprovedTibetanScraper:
                 await self.save_page_html(page, page_id)
                 
                 # Извлекаем изображение
-                print(f"\n  → Поиск изображения...")
+                if not self.quiet_mode:
+                    print(f"\n  → Поиск изображения...")
                 image_result = await self.find_page_image(page, page_id)
                 
                 image_saved = False
@@ -568,36 +592,136 @@ class ImprovedTibetanScraper:
                 if image_result:
                     image_data, source_type = image_result
                     image_source = source_type
-                    print(f"  ℹ Источник изображения: {source_type}")
+                    if not self.quiet_mode:
+                        print(f"  ℹ Источник изображения: {source_type}")
                     
                     # Проверяем что это не просто пустой скриншот
                     if source_type == 'screenshot':
                         print(f"  ⚠ Получен скриншот вместо canvas/img - возможно страница не загрузилась")
-                        # Если это первая попытка, пробуем еще раз
-                        if attempt < max_retries:
+                        print(f"  ✗ Скриншот НЕ сохраняется (требуется реальное изображение)")
+                        
+                        # Если включен auto_sutra, пробуем инкрементировать sutra
+                        if self.auto_sutra and attempt < max_retries:
+                            if not self.quiet_mode:
+                                print(f"  🔍 Пробуем инкрементировать sutra...")
+                            tried_sutras = []
+                            current_sutra = page_sutra
+                            
+                            for sutra_attempt in range(self.max_sutra_attempts):
+                                current_sutra = self.increment_sutra(current_sutra)
+                                tried_sutras.append(current_sutra)
+                                if not self.quiet_mode:
+                                    print(f"  → Попытка с sutra: {current_sutra}")
+                                
+                                # Пробуем загрузить с новой sutra
+                                new_url = f"{self.base_url}index.html?kdb={self.kdb}&sutra={current_sutra}&page={page_id}"
+                                await page.goto(new_url, wait_until='domcontentloaded', timeout=60000)
+                                await self.wait_for_page_load(page)
+                                time.sleep(1)
+                                
+                                # Проверяем изображение
+                                new_image_result = await self.find_page_image(page, page_id)
+                                if new_image_result:
+                                    new_image_data, new_source_type = new_image_result
+                                    if new_source_type in ['canvas', 'img']:
+                                        if not self.quiet_mode:
+                                            print(f"  ✅ Найдена рабочая sutra: {current_sutra}")
+                                        # Обновляем sutra для этого volume
+                                        self.volume_sutras[volume] = current_sutra
+                                        self.last_successful_sutra = current_sutra
+                                        # Обновляем данные для сохранения
+                                        image_result = new_image_result
+                                        image_data = new_image_data
+                                        source_type = new_source_type
+                                        image_source = new_source_type
+                                        url = new_url
+                                        break
+                            else:
+                                # Не нашли рабочую sutra
+                                print(f"  ✗ Не найдена рабочая sutra после попыток: {', '.join(tried_sutras)}")
+                                if attempt < max_retries:
+                                    continue
+                                else:
+                                    image_saved = False
+                        elif attempt < max_retries:
                             continue
+                        else:
+                            image_saved = False
                     
-                    if source_type == 'img' and not image_data.startswith('data:'):
-                        # Это URL, нужно скачать
-                        full_url = urljoin(self.base_url, image_data)
-                        image_saved = await self.download_image_url(session, full_url, image_filename)
-                    else:
-                        # Это data URL или уже готовые данные
-                        image_saved = self.save_image(image_data, image_filename)
+                    # Сохраняем изображение если source_type не screenshot
+                    if source_type != 'screenshot':
+                        if source_type == 'img' and not image_data.startswith('data:'):
+                            # Это URL, нужно скачать
+                            full_url = urljoin(self.base_url, image_data)
+                            image_saved = await self.download_image_url(session, full_url, image_filename)
+                        else:
+                            # Это data URL или уже готовые данные (canvas или img с data:)
+                            image_saved = self.save_image(image_data, image_filename)
                 else:
                     print(f"  ✗ Изображение не найдено")
-                    if attempt < max_retries:
+                    
+                    # Если включен auto_sutra, пробуем инкрементировать sutra
+                    if self.auto_sutra and attempt < max_retries:
+                        if not self.quiet_mode:
+                            print(f"  🔍 Пробуем инкрементировать sutra...")
+                        tried_sutras = []
+                        current_sutra = page_sutra
+                        
+                        for sutra_attempt in range(self.max_sutra_attempts):
+                            current_sutra = self.increment_sutra(current_sutra)
+                            tried_sutras.append(current_sutra)
+                            if not self.quiet_mode:
+                                print(f"  → Попытка с sutra: {current_sutra}")
+                            
+                            # Пробуем загрузить с новой sutra
+                            new_url = f"{self.base_url}index.html?kdb={self.kdb}&sutra={current_sutra}&page={page_id}"
+                            await page.goto(new_url, wait_until='domcontentloaded', timeout=60000)
+                            await self.wait_for_page_load(page)
+                            time.sleep(1)
+                            
+                            # Проверяем изображение
+                            new_image_result = await self.find_page_image(page, page_id)
+                            if new_image_result:
+                                new_image_data, new_source_type = new_image_result
+                                if new_source_type in ['canvas', 'img']:
+                                    if not self.quiet_mode:
+                                        print(f"  ✅ Найдена рабочая sutra: {current_sutra}")
+                                    # Обновляем sutra для этого volume
+                                    self.volume_sutras[volume] = current_sutra
+                                    self.last_successful_sutra = current_sutra
+                                    # Обновляем данные для сохранения
+                                    image_result = new_image_result
+                                    image_data = new_image_data
+                                    source_type = new_source_type
+                                    image_source = new_source_type
+                                    url = new_url
+                                    
+                                    # Сохраняем изображение
+                                    if source_type == 'img' and not image_data.startswith('data:'):
+                                        full_url = urljoin(self.base_url, image_data)
+                                        image_saved = await self.download_image_url(session, full_url, image_filename)
+                                    else:
+                                        image_saved = self.save_image(image_data, image_filename)
+                                    break
+                        else:
+                            # Не нашли рабочую sutra
+                            print(f"  ✗ Не найдена рабочая sutra после попыток: {', '.join(tried_sutras)}")
+                            if attempt < max_retries:
+                                continue
+                    elif attempt < max_retries:
                         continue
                 
                 # Извлекаем текст
-                print(f"\n  → Поиск текста...")
+                if not self.quiet_mode:
+                    print(f"\n  → Поиск текста...")
                 text = await self.extract_tibetan_text(page, page_id)
                 
                 text_saved = False
                 if text:
                     # Показываем превью текста
-                    preview = text[:150] + "..." if len(text) > 150 else text
-                    print(f"  ℹ Превью: {preview}")
+                    if not self.quiet_mode:
+                        preview = text[:150] + "..." if len(text) > 150 else text
+                        print(f"  ℹ Превью: {preview}")
                     text_saved = self.save_text(page_id, text)
                 else:
                     print(f"  ✗ Текст не найден")
@@ -608,6 +732,8 @@ class ImprovedTibetanScraper:
                 # Сохраняем метаданные
                 metadata_entry = {
                     'page_id': page_id,
+                    'volume': volume,
+                    'sutra': self.get_sutra_for_volume(volume),
                     'image_file': image_filename if image_saved else None,
                     'image_source': image_source,
                     'text_file': f"{page_id}.txt" if text_saved else None,
@@ -623,7 +749,8 @@ class ImprovedTibetanScraper:
                 success = image_saved and text_saved
                 
                 if success:
-                    print(f"\n  ✅ Страница успешно обработана")
+                    if not self.quiet_mode:
+                        print(f"\n  ✅ Страница успешно обработана")
                     return True
                 elif image_saved or text_saved:
                     print(f"\n  ⚠ Страница обработана частично")
@@ -708,6 +835,8 @@ class ImprovedTibetanScraper:
         print(f"Режим браузера: {'headless' if headless else 'visible'}")
         print(f"Задержка между страницами: {self.delay_between_pages} сек")
         print(f"Лимит неудач для пропуска volume: {self.max_failed_pages} страниц")
+        if self.quiet_mode:
+            print(f"Режим вывода: ТИХИЙ (только ошибки и предупреждения)")
         print(f"{'#'*60}\n")
         
         async with async_playwright() as p:
@@ -718,8 +847,9 @@ class ImprovedTibetanScraper:
             )
             page = await context.new_page()
             
-            # Включаем вывод console.log из браузера
-            page.on("console", lambda msg: print(f"  [Browser] {msg.text}"))
+            # Включаем вывод console.log из браузера (только если не quiet_mode)
+            if not self.quiet_mode:
+                page.on("console", lambda msg: print(f"  [Browser] {msg.text}"))
             
             async with aiohttp.ClientSession() as session:
                 success_count = 0
@@ -769,7 +899,7 @@ class ImprovedTibetanScraper:
                                     skip_until_next_volume = True
                         
                         # Пауза между запросами
-                        await asyncio.sleep(self.delay_between_pages)
+                        time.sleep(self.delay_between_pages)
                         
                     except KeyboardInterrupt:
                         print("\n\n⚠ Прервано пользователем")
@@ -838,6 +968,9 @@ async def main():
   # Парсинг с видимым браузером (для отладки)
   python improved_parser.py --auto-sutra --pages 1-1b --no-headless
   
+  # Тихий режим (показывать только ошибки и предупреждения)
+  python improved_parser.py --auto-sutra --sutra d1 --start-vol 1 --end-vol 100 --quiet
+  
 Примечания:
   - Страница 1-1a никогда не существует на сайте и будет автоматически пропущена
   - --auto-sutra автоматически подбирает правильную sutra для каждого volume, инкрементируя число при неудачах
@@ -880,6 +1013,8 @@ async def main():
                        help='Конкретные страницы (например: 1-1b 1-2a)')
     parser.add_argument('--no-headless', action='store_true',
                        help='Показывать браузер (для отладки)')
+    parser.add_argument('--quiet', '-q', action='store_true',
+                       help='Тихий режим: выводить только ошибки и предупреждения, скрывать успешные операции')
     
     args = parser.parse_args()
     
@@ -905,7 +1040,8 @@ async def main():
         volume_sutras=volume_sutras,
         auto_sutra=args.auto_sutra,
         max_sutra_attempts=args.max_sutra_attempts,
-        max_failed_pages=args.max_failed_pages
+        max_failed_pages=args.max_failed_pages,
+        quiet_mode=args.quiet
     )
     
     if args.pages:
