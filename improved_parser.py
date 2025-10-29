@@ -53,6 +53,12 @@ class ImprovedTibetanScraper:
         # Отслеживание неудачных попыток для автоматического пропуска volume
         self.current_volume = None
         self.failed_pages_in_volume = 0
+        
+        # КЭШ для оптимизации: сохраняем загруженный HTML и страницу Playwright
+        self.cached_html = None  # Кэшированный HTML контент
+        self.cached_page_id = None  # ID страницы, для которой был загружен HTML
+        self.cached_available_pages = set()  # Множество страниц, доступных в кэшированном HTML
+        self.http_requests_saved = 0  # Счетчик сэкономленных HTTP запросов
     
     def get_sutra_for_volume(self, volume: int) -> str:
         """Получить sutra для конкретного volume, используя mapping или значение по умолчанию"""
@@ -85,6 +91,68 @@ class ImprovedTibetanScraper:
         import re
         match = re.search(r'(\d+)$', sutra)
         return int(match.group(1)) if match else None
+    
+    def extract_available_pages_from_html(self, html_content: str) -> set:
+        """
+        Извлекает список всех доступных страниц из HTML контента
+        Ищет атрибуты data-pbname в HTML
+        """
+        import re
+        available_pages = set()
+        
+        # Ищем все data-pbname="X-Xa" или data-pbname="X-Xb"
+        pattern = r'data-pbname="(\d+-\d+[ab])"'
+        matches = re.findall(pattern, html_content)
+        available_pages.update(matches)
+        
+        if not self.quiet_mode and available_pages:
+            print(f"  📦 В HTML найдено {len(available_pages)} страниц: {sorted(available_pages)[:10]}{'...' if len(available_pages) > 10 else ''}")
+        
+        return available_pages
+    
+    async def cache_current_page(self, page: Page, page_id: str):
+        """
+        Кэширует текущий HTML контент страницы и определяет доступные страницы
+        """
+        try:
+            html_content = await page.content()
+            self.cached_html = html_content
+            self.cached_page_id = page_id
+            self.cached_available_pages = self.extract_available_pages_from_html(html_content)
+            
+            if not self.quiet_mode:
+                print(f"  💾 HTML кэширован для страницы {page_id}")
+        except Exception as e:
+            print(f"  ⚠ Ошибка кэширования HTML: {str(e)}")
+    
+    def is_page_in_cache(self, page_id: str) -> bool:
+        """
+        Проверяет, доступна ли страница в кэшированном HTML
+        """
+        return page_id in self.cached_available_pages
+    
+    async def load_cached_html_to_page(self, page: Page, page_id: str):
+        """
+        Загружает кэшированный HTML в Playwright страницу
+        Это избегает HTTP запроса, используя уже загруженные данные
+        """
+        try:
+            if self.cached_html:
+                # Используем setContent для загрузки HTML без HTTP запроса
+                await page.set_content(self.cached_html, wait_until='domcontentloaded')
+                
+                # Даем время на рендеринг
+                await page.wait_for_timeout(1000)
+                
+                if not self.quiet_mode:
+                    print(f"  ♻️ Использован кэшированный HTML (HTTP запрос НЕ выполнен)")
+                
+                self.http_requests_saved += 1
+                return True
+        except Exception as e:
+            print(f"  ⚠ Ошибка загрузки кэша: {str(e)}")
+        
+        return False
         
     async def wait_for_page_load(self, page: Page, timeout: int = 30000):
         """Ожидание полной загрузки страницы с проверкой контента"""
@@ -524,9 +592,14 @@ class ImprovedTibetanScraper:
         return None
     
     async def scrape_page(self, page: Page, session: aiohttp.ClientSession, page_id: str, 
-                         max_retries: int = 3) -> bool:
+                         max_retries: int = 3) -> Tuple[bool, bool]:
         """
         Парсинг одной страницы с механизмом повторных попыток
+        
+        Returns:
+            Tuple[bool, bool]: (success, used_cache)
+                - success: True если страница успешно обработана
+                - used_cache: True если использовался кэш (не было HTTP запроса)
         """
         # Извлекаем volume из page_id (формат: "volume-page{a/b}")
         volume = int(page_id.split('-')[0])
@@ -549,6 +622,9 @@ class ImprovedTibetanScraper:
                 # Сохраняем последнюю успешную sutra для этого volume
                 self.volume_sutras[volume] = self.last_successful_sutra
         
+        # Переменная для отслеживания использования кэша
+        used_cache = False
+        
         for attempt in range(1, max_retries + 1):
             try:
                 if attempt > 1:
@@ -565,15 +641,31 @@ class ImprovedTibetanScraper:
                 
                 # Формируем URL с параметрами каталога и сутры
                 url = f"{self.base_url}index.html?kdb={self.kdb}&sutra={page_sutra}&page={page_id}"
-                if not self.quiet_mode:
-                    print(f"  URL: {url}")
-                    print(f"  Volume: {volume}, Sutra: {page_sutra}")
-                    if self.auto_sutra and volume in self.volume_sutras:
-                        print(f"  ℹ Sutra определена автоматически")
                 
-                # Переходим на страницу с увеличенным timeout
-                await page.goto(url, wait_until='domcontentloaded', timeout=60000)
-                await self.wait_for_page_load(page)
+                # ОПТИМИЗАЦИЯ: Проверяем, есть ли страница в кэше
+                page_loaded_from_cache = False
+                if self.is_page_in_cache(page_id):
+                    if not self.quiet_mode:
+                        print(f"  🎯 Страница найдена в кэше! Пропускаем HTTP запрос")
+                    # Загружаем кэшированный HTML
+                    page_loaded_from_cache = await self.load_cached_html_to_page(page, page_id)
+                    if page_loaded_from_cache:
+                        used_cache = True  # Отмечаем, что использовали кэш
+                
+                # Если не загрузили из кэша, делаем обычный HTTP запрос
+                if not page_loaded_from_cache:
+                    if not self.quiet_mode:
+                        print(f"  URL: {url}")
+                        print(f"  Volume: {volume}, Sutra: {page_sutra}")
+                        if self.auto_sutra and volume in self.volume_sutras:
+                            print(f"  ℹ Sutra определена автоматически")
+                    
+                    # Переходим на страницу с увеличенным timeout
+                    await page.goto(url, wait_until='domcontentloaded', timeout=60000)
+                    await self.wait_for_page_load(page)
+                    
+                    # Кэшируем загруженный HTML для будущих запросов
+                    await self.cache_current_page(page, page_id)
             
                 # Сохраняем HTML для отладки
                 await self.save_page_html(page, page_id)
@@ -751,10 +843,10 @@ class ImprovedTibetanScraper:
                 if success:
                     if not self.quiet_mode:
                         print(f"\n  ✅ Страница успешно обработана")
-                    return True
+                    return (True, used_cache)
                 elif image_saved or text_saved:
                     print(f"\n  ⚠ Страница обработана частично")
-                    return False
+                    return (False, used_cache)
                 else:
                     # Ничего не получили, пробуем еще раз
                     if attempt < max_retries:
@@ -762,7 +854,7 @@ class ImprovedTibetanScraper:
                         continue
                     else:
                         print(f"\n  ✗ Не удалось получить данные после {max_retries} попыток")
-                        return False
+                        return (False, used_cache)
                 
             except Exception as e:
                 print(f"\n  ✗ Ошибка при обработке (попытка {attempt}/{max_retries}): {str(e)}")
@@ -773,9 +865,9 @@ class ImprovedTibetanScraper:
                 else:
                     import traceback
                     traceback.print_exc()
-                    return False
+                    return (False, used_cache)
         
-        return False
+        return (False, used_cache)
     
     def generate_page_ids(self, start_vol: int, end_vol: int, start_page: int, end_page: int) -> List[str]:
         """
@@ -833,7 +925,7 @@ class ImprovedTibetanScraper:
         print(f"Формат изображений: {self.image_format.upper()}" + 
               (f" (качество: {self.jpeg_quality}%)" if self.image_format == 'jpeg' else ""))
         print(f"Режим браузера: {'headless' if headless else 'visible'}")
-        print(f"Задержка между страницами: {self.delay_between_pages} сек")
+        print(f"Задержка между HTTP запросами: {self.delay_between_pages} сек (не применяется к кэшу)")
         print(f"Лимит неудач для пропуска volume: {self.max_failed_pages} страниц")
         if self.quiet_mode:
             print(f"Режим вывода: ТИХИЙ (только ошибки и предупреждения)")
@@ -878,7 +970,7 @@ class ImprovedTibetanScraper:
                     print(f"\n[{i}/{len(page_ids)}]")
                     
                     try:
-                        success = await self.scrape_page(page, session, page_id)
+                        success, used_cache = await self.scrape_page(page, session, page_id)
                         
                         if success:
                             success_count += 1
@@ -898,8 +990,14 @@ class ImprovedTibetanScraper:
                                     print(f"  ⏭ Пропускаем оставшиеся страницы volume {volume}, переход к следующему volume")
                                     skip_until_next_volume = True
                         
-                        # Пауза между запросами
-                        time.sleep(self.delay_between_pages)
+                        # Пауза между запросами ТОЛЬКО если был выполнен реальный HTTP запрос (не из кэша)
+                        if not used_cache:
+                            if not self.quiet_mode:
+                                print(f"  ⏱ Задержка {self.delay_between_pages} сек перед следующим HTTP запросом...")
+                            time.sleep(self.delay_between_pages)
+                        else:
+                            if not self.quiet_mode:
+                                print(f"  ⚡ Пропуск задержки (страница из кэша)")
                         
                     except KeyboardInterrupt:
                         print("\n\n⚠ Прервано пользователем")
@@ -931,6 +1029,16 @@ class ImprovedTibetanScraper:
         print(f"✗ Неудачно: {fail_count}")
         if skipped_count > 0:
             print(f"⏭ Пропущено (лимит неудач): {skipped_count}")
+        
+        # Статистика оптимизации
+        total_processed = success_count + partial_count + fail_count
+        if self.http_requests_saved > 0:
+            print(f"\n⚡ ОПТИМИЗАЦИЯ:")
+            print(f"  HTTP запросов сэкономлено: {self.http_requests_saved}")
+            if total_processed > 0:
+                efficiency = (self.http_requests_saved / total_processed) * 100
+                print(f"  Эффективность кэширования: {efficiency:.1f}%")
+        
         print(f"\nДанные сохранены в: {self.output_dir.absolute()}")
         print(f"  - Изображения: {self.images_dir}")
         print(f"  - Тексты: {self.texts_dir}")
@@ -943,7 +1051,7 @@ async def main():
     import argparse
     
     parser = argparse.ArgumentParser(
-        description='Улучшенный парсер тибетских иероглифов с adarshah.org',
+        description='Улучшенный парсер тибетских иероглифов с adarshah.org (с кэшированием HTML)',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Примеры использования:
@@ -976,6 +1084,13 @@ async def main():
   - --auto-sutra автоматически подбирает правильную sutra для каждого volume, инкрементируя число при неудачах
   - При --auto-sutra программа пытается загрузить {volume}-1b с разными sutra (d1, d2, d3...) до успеха
   - Максимальное число попыток инкремента задается через --max-sutra-attempts (по умолчанию 10)
+  
+Оптимизация:
+  - Парсер автоматически кэширует HTML страницы
+  - Когда одна HTML страница содержит данные для нескольких страниц (например, 1-1b, 1-25a, 1-25b),
+    парсер автоматически использует кэш и НЕ делает повторные HTTP запросы
+  - Задержка (--delay) применяется ТОЛЬКО к реальным HTTP запросам, страницы из кэша обрабатываются мгновенно
+  - Это значительно ускоряет парсинг и снижает нагрузку на сервер
         """
     )
     
@@ -998,7 +1113,7 @@ async def main():
     parser.add_argument('--jpeg-quality', type=int, default=95, 
                        help='Качество JPEG от 1 до 100 (по умолчанию: 95)')
     parser.add_argument('--delay', type=float, default=2.0,
-                       help='Задержка между запросами страниц в секундах (по умолчанию: 2.0)')
+                       help='Задержка между HTTP запросами в секундах. Не применяется к страницам из кэша (по умолчанию: 2.0)')
     parser.add_argument('--start-vol', type=int, default=1, 
                        help='Начальный том (по умолчанию: 1)')
     parser.add_argument('--end-vol', type=int, default=1, 
