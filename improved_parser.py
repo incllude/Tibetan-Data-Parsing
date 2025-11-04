@@ -29,12 +29,10 @@ class ImprovedTibetanScraper:
         self.images_dir = self.output_dir / "images"
         self.texts_dir = self.output_dir / "texts"
         self.metadata_file = self.output_dir / "metadata.json"
-        self.raw_dir = self.output_dir / "raw_html"  # Для отладки
         
         # Создаем необходимые директории
         self.images_dir.mkdir(parents=True, exist_ok=True)
         self.texts_dir.mkdir(parents=True, exist_ok=True)
-        self.raw_dir.mkdir(parents=True, exist_ok=True)
         
         self.base_url = "https://online.adarshah.org/"
         self.kdb = kdb  # Каталог (degekangyur, degetengyur и т.д.)
@@ -365,7 +363,7 @@ class ImprovedTibetanScraper:
     
     async def extract_tibetan_text(self, page: Page, page_id: str) -> Optional[str]:
         """
-        Извлечение тибетского текста для конкретной страницы
+        Извлечение тибетского текста для конкретной страницы с сохранением разбивки на строчки
         Использует маркеры <jp> и data-pbname для точного определения текста
         """
         try:
@@ -382,6 +380,29 @@ class ImprovedTibetanScraper:
                         jpId = pageId;
                     }
                     
+                    // Функция для извлечения текста с сохранением разрывов строк
+                    function extractTextWithLineBreaks(element) {
+                        let text = '';
+                        const childNodes = element.childNodes;
+                        
+                        for (let node of childNodes) {
+                            if (node.nodeType === Node.TEXT_NODE) {
+                                text += node.textContent;
+                            } else if (node.nodeType === Node.ELEMENT_NODE) {
+                                // Проверяем, является ли элемент маркером разрыва строки
+                                if (node.classList && node.classList.contains('ln') && 
+                                    node.classList.contains('break')) {
+                                    text += '\\n';
+                                } else {
+                                    // Рекурсивно обрабатываем вложенные элементы
+                                    text += extractTextWithLineBreaks(node);
+                                }
+                            }
+                        }
+                        
+                        return text;
+                    }
+                    
                     // Метод 1: Поиск по маркерам <jp>
                     const jpStart = document.querySelector(`jp[id="${jpId}"]`);
                     let textByJp = '';
@@ -395,11 +416,11 @@ class ImprovedTibetanScraper:
                                 break;
                             }
                             
-                            // Извлекаем текст
+                            // Извлекаем текст с учетом разрывов строк
                             if (currentNode.nodeType === Node.TEXT_NODE) {
                                 textByJp += currentNode.textContent;
                             } else if (currentNode.nodeType === Node.ELEMENT_NODE) {
-                                textByJp += currentNode.textContent;
+                                textByJp += extractTextWithLineBreaks(currentNode);
                             }
                             
                             currentNode = currentNode.nextSibling;
@@ -411,7 +432,7 @@ class ImprovedTibetanScraper:
                     let textByAttr = '';
                     
                     textElements.forEach(el => {
-                        textByAttr += el.textContent;
+                        textByAttr += extractTextWithLineBreaks(el);
                     });
                     
                     // Выбираем наиболее подходящий текст
@@ -422,8 +443,10 @@ class ImprovedTibetanScraper:
                     function cleanText(text) {
                         // Удаляем ID страниц вида "1-2a"
                         text = text.replace(/\\d+-\\d+[ab]/g, '');
-                        // Удаляем множественные пробелы и переносы
-                        text = text.replace(/\\s+/g, ' ');
+                        // Удаляем множественные пробелы, НО сохраняем переносы строк
+                        text = text.split('\\n').map(line => line.replace(/\\s+/g, ' ').trim()).join('\\n');
+                        // Удаляем пустые строки
+                        text = text.split('\\n').filter(line => line.length > 0).join('\\n');
                         return text.trim();
                     }
                     
@@ -518,15 +541,6 @@ class ImprovedTibetanScraper:
             print(f"  ✗ Ошибка сохранения текста: {str(e)}")
             return False
     
-    async def save_page_html(self, page: Page, page_id: str):
-        """Сохранение HTML для отладки"""
-        try:
-            html = await page.content()
-            filepath = self.raw_dir / f"{page_id}.html"
-            with open(filepath, 'w', encoding='utf-8') as f:
-                f.write(html)
-        except Exception as e:
-            print(f"  ⚠ Не удалось сохранить HTML: {str(e)}")
     
     def save_metadata(self):
         """Сохранение метаданных"""
@@ -666,9 +680,6 @@ class ImprovedTibetanScraper:
                     
                     # Кэшируем загруженный HTML для будущих запросов
                     await self.cache_current_page(page, page_id)
-            
-                # Сохраняем HTML для отладки
-                await self.save_page_html(page, page_id)
                 
                 # Извлекаем изображение
                 if not self.quiet_mode:
