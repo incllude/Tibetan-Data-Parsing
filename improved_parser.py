@@ -245,15 +245,21 @@ class ImprovedTibetanScraper:
             print(f"  ✗ Ошибка извлечения из canvas: {str(e)}")
             return None
     
-    async def find_page_image(self, page: Page, page_id: str) -> Optional[Tuple[str, str]]:
+    async def find_page_image(self, page: Page, page_id: str, allow_canvas: bool = True) -> Optional[Tuple[str, str]]:
         """
         Поиск изображения страницы
         Возвращает: (image_data, source_type) где source_type = 'canvas' | 'img' | 'screenshot'
+        
+        Args:
+            page: Playwright страница
+            page_id: ID страницы для поиска
+            allow_canvas: Разрешить извлечение из canvas (False при использовании кэша)
         """
-        # Способ 1: Извлечение из canvas
-        canvas_data = await self.extract_image_from_canvas(page)
-        if canvas_data:
-            return (canvas_data, 'canvas')
+        # Способ 1: Извлечение из canvas (только если allow_canvas=True)
+        if allow_canvas:
+            canvas_data = await self.extract_image_from_canvas(page)
+            if canvas_data:
+                return (canvas_data, 'canvas')
         
         # Способ 2: Поиск img элемента
         try:
@@ -574,8 +580,8 @@ class ImprovedTibetanScraper:
                 await page.goto(url, wait_until='domcontentloaded', timeout=30000)
                 time.sleep(2)
                 
-                # Пробуем найти изображение (строгая проверка)
-                image_result = await self.find_page_image(page, page_id)
+                # Пробуем найти изображение (строгая проверка, всегда allow_canvas=True при автоподборе)
+                image_result = await self.find_page_image(page, page_id, allow_canvas=True)
                 
                 # ВАЖНО: Принимаем только реальные изображения (canvas или img), НЕ screenshot
                 if image_result:
@@ -684,7 +690,8 @@ class ImprovedTibetanScraper:
                 # Извлекаем изображение
                 if not self.quiet_mode:
                     print(f"\n  → Поиск изображения...")
-                image_result = await self.find_page_image(page, page_id)
+                # ВАЖНО: Не используем canvas при загрузке из кэша, т.к. canvas содержит изображение первой страницы
+                image_result = await self.find_page_image(page, page_id, allow_canvas=(not page_loaded_from_cache))
                 
                 image_saved = False
                 # Определяем расширение файла в зависимости от формата
@@ -722,8 +729,8 @@ class ImprovedTibetanScraper:
                                 await self.wait_for_page_load(page)
                                 time.sleep(1)
                                 
-                                # Проверяем изображение
-                                new_image_result = await self.find_page_image(page, page_id)
+                                # Проверяем изображение (всегда allow_canvas=True при инкременте sutra)
+                                new_image_result = await self.find_page_image(page, page_id, allow_canvas=True)
                                 if new_image_result:
                                     new_image_data, new_source_type = new_image_result
                                     if new_source_type in ['canvas', 'img']:
@@ -782,8 +789,8 @@ class ImprovedTibetanScraper:
                             await self.wait_for_page_load(page)
                             time.sleep(1)
                             
-                            # Проверяем изображение
-                            new_image_result = await self.find_page_image(page, page_id)
+                            # Проверяем изображение (всегда allow_canvas=True при инкременте sutra)
+                            new_image_result = await self.find_page_image(page, page_id, allow_canvas=True)
                             if new_image_result:
                                 new_image_data, new_source_type = new_image_result
                                 if new_source_type in ['canvas', 'img']:
