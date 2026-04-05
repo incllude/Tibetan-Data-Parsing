@@ -899,11 +899,9 @@ class ImprovedTibetanScraper:
                         if source_type == 'img' and not image_data.startswith('data:'):
                             # Это URL, нужно скачать
                             full_url = urljoin(self.base_url, image_data)
-                            print(f"  🖼 URL картинки: {full_url}")
                             image_saved = await self.download_image_url(session, full_url, image_filename)
                         else:
                             # Это data URL или уже готовые данные (canvas или img с data:)
-                            print(f"  🖼 URL картинки: {url}  [{source_type}]")
                             image_saved = self.save_image(image_data, image_filename)
                 else:
                     print(f"  ✗ Изображение не найдено")
@@ -957,10 +955,8 @@ class ImprovedTibetanScraper:
                                     
                                     if source_type == 'img' and not image_data.startswith('data:'):
                                         full_url = urljoin(self.base_url, image_data)
-                                        print(f"  🖼 URL картинки: {full_url}")
                                         image_saved = await self.download_image_url(session, full_url, image_filename)
                                     else:
-                                        print(f"  🖼 URL картинки: {url}  [{source_type}]")
                                         image_saved = self.save_image(image_data, image_filename)
                                     break
                         else:
